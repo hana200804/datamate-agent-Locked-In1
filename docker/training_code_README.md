@@ -6,4 +6,4 @@ Gói được tạo bằng `scripts/pack_training_code.py`. `src/` chứa mã tr
 
 Không có lượt train thì gói chỉ chứa mã nguồn; manifest ghi rõ không có bằng chứng train. Không được dùng nó để tuyên bố đã train hay đạt điểm.
 
-Để train mới từ SFT của lượt riêng: `bash train.sh` trong image. Tùy chỉnh tham số theo `evidence/flow.json` nếu cần khớp lượt đã ghi; script mặc định max-len 24576, LR 1e-4, rank 16, alpha 32, một epoch. Model base có sẵn tại `/code/models/Qwen3.5-9B`.
+Để train mới từ SFT của lượt riêng: `bash train.sh` trong image nghiên cứu được build với `--build-arg INSTALL_TRAINING_ENV=1`, hoặc đặt `PYTHON` trỏ đến môi trường train tương ứng. Image nộp base-only chỉ kèm source, không cài venv train. Tùy chỉnh tham số theo `evidence/flow.json` nếu cần khớp lượt đã ghi; script mặc định max-len 24576, LR 1e-4, rank 16, alpha 32, một epoch. Model base có sẵn tại `/code/models/Qwen3.5-9B`. Hướng dẫn chạy Docker nằm ở `docker-runbook.md` trong gói này.

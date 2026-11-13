@@ -7,11 +7,13 @@ ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PIP_NO_CACHE_DIR=1 NCCL_P2P_DISABLE=
 WORKDIR /code
 COPY docker/requirements.txt /code/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /code/requirements.txt
-# Training pins its own torch/transformers: a separate offline-ready venv, so the vLLM environment stays untouched
+# Training source is always included. Its separate, large environment is opt-in;
+# the base-only submission does not train or need a second torch/CUDA stack.
+ARG INSTALL_TRAINING_ENV=0
 COPY training/requirements.txt /code/training_code/requirements.txt
-RUN python3 -m venv /opt/venv-train \
+RUN if [ "$INSTALL_TRAINING_ENV" = 1 ]; then python3 -m venv /opt/venv-train \
     && /opt/venv-train/bin/pip install --no-cache-dir -r /code/training_code/requirements.txt \
-    && /opt/venv-train/bin/pip install --no-cache-dir fla-core==0.6.0 --no-deps
+    && /opt/venv-train/bin/pip install --no-cache-dir fla-core==0.6.0 --no-deps; fi
 # Weights first, so a code change does not invalidate their layers
 COPY models/Qwen3.5-9B /code/models/Qwen3.5-9B
 COPY build/training_code/ /code/training_code/

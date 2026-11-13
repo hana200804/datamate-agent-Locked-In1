@@ -1,0 +1,696 @@
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 18e02fc..bba5c94 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -7,11 +7,13 @@ ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PIP_NO_CACHE_DIR=1 NCCL_P2P_DISABLE=
+ WORKDIR /code
+ COPY docker/requirements.txt /code/requirements.txt
+ RUN python3 -m pip install --no-cache-dir -r /code/requirements.txt
+-# Training pins its own torch/transformers: a separate offline-ready venv, so the vLLM environment stays untouched
++# Training source is always included. Its separate, large environment is opt-in;
++# the base-only submission does not train or need a second torch/CUDA stack.
++ARG INSTALL_TRAINING_ENV=0
+ COPY training/requirements.txt /code/training_code/requirements.txt
+-RUN python3 -m venv /opt/venv-train \
++RUN if [ "$INSTALL_TRAINING_ENV" = 1 ]; then python3 -m venv /opt/venv-train \
+     && /opt/venv-train/bin/pip install --no-cache-dir -r /code/training_code/requirements.txt \
+-    && /opt/venv-train/bin/pip install --no-cache-dir fla-core==0.6.0 --no-deps
++    && /opt/venv-train/bin/pip install --no-cache-dir fla-core==0.6.0 --no-deps; fi
+ # Weights first, so a code change does not invalidate their layers
+ COPY models/Qwen3.5-9B /code/models/Qwen3.5-9B
+ COPY build/training_code/ /code/training_code/
+diff --git a/docker/README.md b/docker/README.md
+index e374da7..1b8020f 100644
+--- a/docker/README.md
++++ b/docker/README.md
+@@ -2,33 +2,35 @@
+ 
+ Chủ dự án: Nguyen Han (@hana200804). Mã và nguồn gốc: `/code/LICENSE`, `/code/NOTICE.md`.
+ 
+-Image mặc định chạy Qwen3.5-9B gốc, không LoRA, không view public lưu sẵn. Model được ghim revision trong `model_manifest.json`; DuckDB chạy SQL do model sinh và đầu ra được bỏ phiếu. Chưa kiểm chứng lại image trên GPU sau lần dọn repo này.
++Cấu hình nộp: **Qwen3.5-9B gốc**, revision trong `model_manifest.json`, **không LoRA**, `--k 8 --think-k 4`, fp8, few-shot `assets/fewshot_bank.jsonl`; các cờ còn lại ở `scripts/flags.sh`. Không copy `adapters/` hoặc view public lưu sẵn. `LORA_DIR` và cờ LoRA bị entrypoint từ chối. Chưa build/chạy GPU được trên máy chuẩn bị hiện tại.
+ 
+-## Chuẩn bị và build
+-
+-Tải model vào `models/Qwen3.5-9B` theo README gốc của repo, rồi:
++Lệnh tải model, pack, build, smoke 20 câu, full public có đo thời gian và export: xem [runbook tiếng Việt trong repo](../docs/docker-runbook.md), cũng được pack vào `/code/training_code/docker-runbook.md` trong image. Không commit/push dữ liệu, weights hoặc artifacts.
+ 
+ ```bash
+ bash docker/build.sh pack
+ bash docker/build.sh build
+-bash docker/build.sh test 10
++NUM_GPUS=1 RESULT="$PWD/result_smoke" bash docker/build.sh test 20
++NUM_GPUS=2 RESULT="$PWD/result_public" bash docker/build.sh test
+ bash docker/build.sh export
+ ```
+ 
+-`TEAM` mặc định `locked-in1`; image là `zaic2026_datamate_locked-in1:final`. `pack` tạo bản mã train và manifest SHA-256; không giả định có adapter hay dữ liệu train v1/v2/v3. Nếu có lượt train riêng, thêm bằng `python scripts/pack_training_code.py --run runs/from_base --train-data data/train` trước khi build. Gói có dữ liệu chỉ phục vụ build nội bộ, không commit hoặc upload vào repo public.
++`TEAM` mặc định `locked-in1`; image `zaic2026_datamate_locked-in1:final`. `test` tự chọn tối đa 2 GPU nếu không đặt `NUM_GPUS`; mỗi `RESULT` phải mới/rỗng. Không cần `.venv` trên host để check kết quả: helper chạy checker CPU trong image. `test 20` chỉ suy luận 20 câu đầu, vẫn ghi đủ ID của toàn tập với `abstain` cho phần còn lại.
++
++`pack` dùng Python stdlib, không GPU/mạng; tạo `build/training_code/` và manifest SHA-256. Nếu thư mục đã có, chuyển gói cũ sang tên khác trước khi pack lại. Gói mặc định chỉ chứa mã train và few-shot, không adapter/dữ liệu train. Build preflight kiểm tra mọi COPY input, revision/checksum weights qua metadata của `hf download`, checksum gói, cờ/few-shot mới nhất và từ chối adapter hoặc gói `--run`/`--train-data` trong cấu hình nộp. Giữ `.cache/huggingface/download/*.metadata` cạnh model đến khi preflight xong.
+ 
+ ```bash
++mkdir -p result_manual
+ docker run --rm --gpus '"device=0,1"' --network none --shm-size=16g \
+-  -v /path/to/public_test:/data:ro -v "$PWD/result_docker:/result" \
++  -v /path/to/public_test:/data:ro -v "$PWD/result_manual:/result" \
+   zaic2026_datamate_locked-in1:final
+ ```
+ 
+-Dữ liệu đầu vào `/data` có `questions.jsonl`, `rulebook.md`, `calendar.csv`, `data/<shop>/`. Đầu ra: `/result/submission.jsonl`, `/result/logs/<id>.json` và `/result/work/`.
++`/data` chứa `questions.jsonl`, `rulebook.md`, `calendar.csv`, `data/<shop>/`. Output: `/result/submission.jsonl`, `/result/logs/<id>.json`, `/result/work/run.*/shard*/` và `shard*.log`. Mỗi lần chạy có shard root mới; log cũ chuyển vào `work/run.*/previous-logs/` để tránh lẫn kết quả. Pipeline lưu và merge sau mỗi shop.
+ 
+-`NUM_GPUS`, `TIMEOUT_SECONDS` (mặc định 21000), `GPU_MEM`, `QUANT`, `ENGINE`, `THINK_K` điều chỉnh cách chạy. Timeout là giới hạn tiến trình, chưa phải bằng chứng hoàn tất toàn bộ tập trong thời hạn thi.
++Entrypoint tạo submission đủ ID, mặc định `abstain`, **trước** khi tải model; khi worker lỗi, timeout hoặc nhận TERM/INT thì dừng worker, merge và bổ sung log. Lỗi worker/checker trả mã khác 0; timeout thường là 124, TERM là 143. SIGKILL/mất điện không chạy được trap nhưng submission đã ghi nguyên tử trước đó vẫn còn. Điều này cần input hợp lệ và `/result` ghi được; `format OK` chứng minh định dạng, chưa chứng minh đã giải hết hoặc đạt PA.
+ 
+-Dùng adapter tự train: mount thư mục adapter vào `/code/models/own_lora:ro` và thêm `-e LORA_DIR=/code/models/own_lora`. Mặc định fp8 cần GPU tương thích; điều chỉnh quant/context/engine cho phần cứng thực tế.
++`TIMEOUT_SECONDS` mặc định và tối đa **21000** (5 giờ 50 phút, tính cả model load), thêm tối đa 15 giây để kill worker; thời gian khởi động/finalize dùng phần dự phòng trước mốc 6 giờ. `NUM_GPUS` là 1 hoặc 2; mỗi GPU tải một bản model, chia shop theo data parallel, không cộng VRAM. Mặc định `QUANT=fp8`, `THINK_K=4`, `GPU_MEM=0.92`, `ENGINE` như `flags.sh`; giữ các giá trị này khi tái lập cấu hình đã chọn. GPU 24 GB vẫn phải kiểm chứng với context 49152 và fp8; không suy ra khả năng chạy từ dung lượng VRAM.
+ 
+-## Train lại
++## Mã train
+ 
+-Image có môi trường train riêng ở `/opt/venv-train`. Nếu đã pack lượt train có `sft/sql_rft_notes.jsonl`, chạy `bash /code/training_code/train.sh`. Script khởi tạo adapter mới từ model gốc; dùng tham số đúng với lượt train đã ghi trong `evidence/flow.json` khi cần tái lập cấu hình riêng.
++`/code/training_code/` luôn có source và manifest. Bản nộp base-only bỏ cài venv train để tránh nhân đôi torch/CUDA và tăng dung lượng; suy luận vẫn đầy đủ. Nếu cần một image **nghiên cứu train riêng**, build bằng `docker build --build-arg INSTALL_TRAINING_ENV=1 -f docker/Dockerfile -t datamate-train .` để có `/opt/venv-train`. SFT của lượt train riêng phải được cung cấp riêng; cấu hình nộp mặc định không kèm SFT/adapter. `docker/train.sh` chỉ dùng được khi môi trường train và SFT đã có.
+diff --git a/docker/build.sh b/docker/build.sh
+index b107c57..acf29af 100755
+--- a/docker/build.sh
++++ b/docker/build.sh
+@@ -3,7 +3,7 @@
+ # Needs Docker with BuildKit and the NVIDIA Container Toolkit (sudo or the docker group). Run from anywhere:
+ #   TEAM=<team> bash docker/build.sh pack      # scripts/pack_training_code.py -> build/training_code
+ #   TEAM=<team> bash docker/build.sh build     # image zaic2026_datamate_<team>:final, then platform, size and /code layout
+-#   TEAM=<team> bash docker/build.sh test [N]  # scoring command (2 GPUs, no network, read-only /data, 16 GiB shm) on the
++#   TEAM=<team> bash docker/build.sh test [N]  # scoring command (1/2 GPUs, no network, read-only /data, 16 GiB shm) on the
+ #                                              # public test -> result_docker/ (N = first N questions, a smoke test only)
+ #   TEAM=<team> bash docker/build.sh export    # .tar.gz, uncompressed .tar size in bytes, and the .md5 file to send
+ set -euo pipefail
+@@ -17,19 +17,33 @@ case "${1:-}" in
+     python3 scripts/pack_training_code.py
+     ;;
+   build)
+-    for f in models/Qwen3.5-9B/config.json build/training_code/data_manifest.json; do
+-      [ -s "$f" ] || { echo "missing $f (base model download, docker/build.sh pack)" >&2; exit 1; }
+-    done
++    python3 docker/verify_context.py
+     DOCKER_BUILDKIT=1 $DOCKER build --platform linux/amd64 -f docker/Dockerfile -t "$IMAGE" .
+     $DOCKER image inspect -f '{{.Os}}/{{.Architecture}} {{.Size}}' "$IMAGE"
+     $DOCKER run --rm --network none --entrypoint "" "$IMAGE" find /code -maxdepth 2
+     ;;
+   test)
+     data=${DATA:-$PWD/data/public_test}
+-    mkdir -p result_docker
+-    $DOCKER run --rm --gpus '"device=0,1"' --network none --shm-size=16g --entrypoint bash \
+-      -v "$(realpath "$data")":/data:ro -v "$PWD/result_docker":/result "$IMAGE" /code/predict.sh ${2:+--limit "$2"}
+-    .venv/bin/python -m datamate.submission check result_docker/submission.jsonl --questions "$data/questions.jsonl"
++    result=${RESULT:-$PWD/result_docker}
++    [ -s "$data/questions.jsonl" ] || { echo "missing $data/questions.jsonl" >&2; exit 1; }
++    if [ -n "${2:-}" ] && ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then echo 'N must be positive' >&2; exit 2; fi
++    ng=${NUM_GPUS:-$(nvidia-smi --query-gpu=uuid --format=csv,noheader | wc -l)}
++    if [ -z "${NUM_GPUS:-}" ] && [[ "$ng" =~ ^[0-9]+$ ]] && (( ng > 2 )); then ng=2; fi
++    [[ "$ng" =~ ^[12]$ ]] || { echo 'NUM_GPUS must be 1 or 2' >&2; exit 2; }
++    gpu_request='"device=0"'
++    [ "$ng" = 1 ] || gpu_request='"device=0,1"'
++    mkdir -p "$result"
++    [ -z "$(ls -A "$result")" ] || { echo "RESULT must be empty: $result (choose a new RESULT)" >&2; exit 1; }
++    args=(); [ -z "${2:-}" ] || args=(--limit "$2")
++    status=0
++    $DOCKER run --rm --gpus "$gpu_request" --network none --shm-size=16g --entrypoint bash \
++      -e "NUM_GPUS=$ng" -e "TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-21000}" \
++      -v "$(realpath "$data")":/data:ro -v "$(realpath "$result")":/result "$IMAGE" /code/predict.sh "${args[@]}" || status=$?
++    # Check inside the image too: no host .venv is required. Preserve worker errors.
++    $DOCKER run --rm --network none --entrypoint python3 \
++      -v "$(realpath "$data")":/data:ro -v "$(realpath "$result")":/result:ro "$IMAGE" \
++      -m datamate.submission check /result/submission.jsonl --questions /data/questions.jsonl || status=1
++    exit "$status"
+     ;;
+   export)
+     set -o pipefail
+diff --git a/docker/model_manifest.json b/docker/model_manifest.json
+index 2e3b598..dd918dc 100644
+--- a/docker/model_manifest.json
++++ b/docker/model_manifest.json
+@@ -13,12 +13,12 @@
+   "total_parameters_with_adapter": 9653104368,
+   "vllm": "0.32.0",
+   "dtype": "bfloat16 weights, fp8 online quantization",
+-  "enable_thinking": "Per-shop view and debt drafts; additional question samples controlled by THINK_K (default 0).",
++  "enable_thinking": "Per-shop view and debt drafts; additional question samples controlled by THINK_K (default 4).",
+   "temperature": "0.7 SQL samples; 0.6 / top_k 20 thinking; greedy repairs",
+   "seed": 0,
+   "language_model_only": true,
+   "gpu_validated": false,
+-  "note": "DataMate Agent Locked-In1 uses the pinned base model by default. An own trained adapter may be mounted using LORA_DIR. This Docker image has not been GPU-validated after repository cleanup.",
++  "note": "Submission configuration: pinned base model, no LoRA, k=8, think-k=4, assets/fewshot_bank.jsonl. This Docker image has not been GPU-validated after repository cleanup.",
+   "base_model_path_in_image": "/code/models/Qwen3.5-9B",
+   "training_only_models": []
+ }
+diff --git a/docker/predict.sh b/docker/predict.sh
+index 98decfb..8acb848 100755
+--- a/docker/predict.sh
++++ b/docker/predict.sh
+@@ -1,31 +1,68 @@
+ #!/usr/bin/env bash
+-# Entry point of the image: bash /code/predict.sh, no arguments (organizers' Docker guide, section 5). All settings are fixed in
+-# /code/flags.sh. Reads /data (read-only); writes into /result:
+-#   submission.jsonl  every question id; rewritten after each shop by every process, so answers saved before a stop still count
+-#   logs/<id>.json    one log record per question on one line: id, answer, elapsed_ms, thinking, code, output (+ the full trace)
+-#   work/shard<i>/    per-GPU working files: the shop layers (views, debt macros) the SQL reads, trace.jsonl, process log
+-# One datamate.predict process per GPU (data parallel over shops, no tensor parallelism, so no NCCL traffic between the GPUs).
+-# Each process stops itself at TIMEOUT_SECONDS (5 h 50 min), below the 6 h limit that includes model loading.
+-set -uo pipefail
++# Offline entrypoint: one process per GPU, shops split over 1 or 2 GPUs.
++# Each process saves/merges after every shop. Initialize all-abstain output
++# before GPU/model startup, and finalize it on timeout, worker failure or TERM.
++set -euo pipefail
+ cd /code
+ source ./flags.sh
+ DATA="${DATA_DIR:-/data}" OUT="${RESULT_DIR:-/result}"
+-NG="${NUM_GPUS:-$(nvidia-smi -L | wc -l)}"
+ T="${TIMEOUT_SECONDS:-21000}"
+-LORA=(); [ -z "${LORA_DIR:-}" ] || LORA=(--lora "$LORA_DIR" --lora-thinking)
+-mkdir -p "$OUT/logs" "$OUT/work"
+ start=$(date +%s)
+-echo "datamate: $NG GPU(s), $(grep -c . "$DATA/questions.jsonl") questions, timeout ${T}s"
+-for i in $(seq 0 $((NG - 1))); do
+-  CUDA_VISIBLE_DEVICES=$i timeout --signal=TERM --kill-after=15s "${T}s" \
+-    python3 -m datamate.predict --data "$DATA" --output "$OUT/work/shard$i" --shard "$i/$NG" --deadline "$(( T - 900 ))" \
++mkdir -p "$OUT/work"
++# A new shard root prevents answers from an earlier run entering this submission.
++WORK=$(mktemp -d "$OUT/work/run.XXXXXXXX")
++if [ -d "$OUT/logs" ]; then mv "$OUT/logs" "$WORK/previous-logs"; fi
++mkdir -p "$OUT/logs"
++pids=()
++finalize() {
++  local status=$? pid
++  trap - EXIT TERM INT
++  for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
++  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
++  python3 -m datamate.submission merge "$OUT" --shards "$WORK" --no-copy-logs --questions "$DATA/questions.jsonl" || status=1
++  python3 -m datamate.submission fill-logs "$OUT/logs" --questions "$DATA/questions.jsonl" || status=1
++  python3 -m datamate.submission check "$OUT/submission.jsonl" --questions "$DATA/questions.jsonl" || status=1
++  grep -h -E 'model ready|loaded [0-9]+ shops|view drafts|debt drafts' "$WORK"/shard*.log || true
++  echo "datamate: done in $(( $(date +%s) - start ))s, status $status; work $WORK"
++  exit "$status"
++}
++# This also checks that the input question IDs are readable before any GPU work.
++python3 -m datamate.submission merge "$OUT" --shards "$WORK" --no-copy-logs --questions "$DATA/questions.jsonl"
++trap finalize EXIT
++trap 'exit 143' TERM
++trap 'exit 130' INT
++[[ "$T" =~ ^[1-9][0-9]*$ ]] && (( T <= 21000 )) || { echo 'TIMEOUT_SECONDS must be 1..21000' >&2; exit 2; }
++# The submission runs only the base model, even when the host has a LoRA env var.
++[ -z "${LORA_DIR:-}" ] || { echo 'Submission image does not accept LORA_DIR' >&2; exit 2; }
++for arg in "$@"; do
++  case "$arg" in --lora|--lora=*|--lora-thinking) echo 'Submission image does not accept LoRA flags' >&2; exit 2;; esac
++done
++if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
++  IFS=, read -ra devices <<< "$CUDA_VISIBLE_DEVICES"
++else
++  gpu_list=$(nvidia-smi --query-gpu=uuid --format=csv,noheader) || { echo 'Cannot enumerate GPUs' >&2; exit 1; }
++  devices=()
++  while IFS= read -r device; do [ -z "$device" ] || devices+=("$device"); done <<< "$gpu_list"
++fi
++available=${#devices[@]}
++NG="${NUM_GPUS:-$(( available > 2 ? 2 : available ))}"
++[[ "$NG" =~ ^[12]$ ]] && (( NG <= available )) || { echo "Need 1 or 2 visible GPUs; requested $NG, visible $available" >&2; exit 2; }
++deadline=$(( T > 900 ? T - 900 : 1 ))
++echo "datamate: $NG GPU(s), timeout ${T}s (includes model load), work $WORK"
++for ((i=0; i<NG; i++)); do
++  CUDA_VISIBLE_DEVICES="${devices[i]}" timeout --signal=TERM --kill-after=15s "${T}s" \
++    python3 -m datamate.predict --data "$DATA" --output "$WORK/shard$i" --shard "$i/$NG" --deadline "$deadline" \
+     --log-dir "$OUT/logs" --merge-into "$OUT" \
+-    --model /code/models/Qwen3.5-9B "${LORA[@]}" --fewshot /code/assets/fewshot_bank.jsonl \
+-    "${DATAMATE_FLAGS[@]}" --engine "$DATAMATE_ENGINE" "$@" > "$OUT/work/shard$i.log" 2>&1 &
++    --model /code/models/Qwen3.5-9B --fewshot /code/assets/fewshot_bank.jsonl \
++    "${DATAMATE_FLAGS[@]}" --engine "$DATAMATE_ENGINE" "$@" > "$WORK/shard$i.log" 2>&1 &
++  pids+=("$!")
++done
++status=0
++for i in "${!pids[@]}"; do
++  worker_status=0
++  wait "${pids[i]}" || worker_status=$?
++  echo "datamate: shard$i exited $worker_status"
++  if (( worker_status != 0 )); then status=$worker_status; fi
+ done
+-wait
+-python3 -m datamate.submission merge "$OUT" --shards "$OUT/work" --no-copy-logs --questions "$DATA/questions.jsonl"
+-python3 -m datamate.submission fill-logs "$OUT/logs" --questions "$DATA/questions.jsonl"
+-python3 -m datamate.submission check "$OUT/submission.jsonl" --questions "$DATA/questions.jsonl" || true
+-grep -h -E "model ready|loaded [0-9]+ shops|view drafts|debt drafts" "$OUT"/work/shard*.log || true
+-echo "datamate: done in $(( $(date +%s) - start ))s, $(ls "$OUT/logs" | wc -l) question logs"
++pids=()
++exit "$status"
+diff --git a/docker/training_code_README.md b/docker/training_code_README.md
+index 3d91ca2..2a0f3f6 100644
+--- a/docker/training_code_README.md
++++ b/docker/training_code_README.md
+@@ -6,4 +6,4 @@ Gói được tạo bằng `scripts/pack_training_code.py`. `src/` chứa mã tr
+ 
+ Không có lượt train thì gói chỉ chứa mã nguồn; manifest ghi rõ không có bằng chứng train. Không được dùng nó để tuyên bố đã train hay đạt điểm.
+ 
+-Để train mới từ SFT của lượt riêng: `bash train.sh` trong image. Tùy chỉnh tham số theo `evidence/flow.json` nếu cần khớp lượt đã ghi; script mặc định max-len 24576, LR 1e-4, rank 16, alpha 32, một epoch. Model base có sẵn tại `/code/models/Qwen3.5-9B`.
++Để train mới từ SFT của lượt riêng: `bash train.sh` trong image nghiên cứu được build với `--build-arg INSTALL_TRAINING_ENV=1`, hoặc đặt `PYTHON` trỏ đến môi trường train tương ứng. Image nộp base-only chỉ kèm source, không cài venv train. Tùy chỉnh tham số theo `evidence/flow.json` nếu cần khớp lượt đã ghi; script mặc định max-len 24576, LR 1e-4, rank 16, alpha 32, một epoch. Model base có sẵn tại `/code/models/Qwen3.5-9B`. Hướng dẫn chạy Docker nằm ở `docker-runbook.md` trong gói này.
+diff --git a/scripts/flags.sh b/scripts/flags.sh
+index 86b9f69..e09017d 100755
+--- a/scripts/flags.sh
++++ b/scripts/flags.sh
+@@ -2,6 +2,6 @@
+ # so the three always run the same flags. Paths of the model, the adapter and the example bank are set by each caller.
+ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_NO_USAGE_STATS=1 TOKENIZERS_PARALLELISM=false PYTHONHASHSEED=0
+ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+-DATAMATE_FLAGS=(--quant "${QUANT:-fp8}" --k 8 --think-k "${THINK_K:-0}" --context 49152 --think-budget 16384 --notes --max-tokens 2048
++DATAMATE_FLAGS=(--quant "${QUANT:-fp8}" --k 8 --think-k "${THINK_K:-4}" --context 49152 --think-budget 16384 --notes --max-tokens 2048
+                 --debt-views --debt-route --canon-names --answer-unanswerable --gpu-mem "${GPU_MEM:-0.92}")
+ DATAMATE_ENGINE="${ENGINE:-{\"kv_cache_dtype\":\"fp8\",\"max_num_seqs\":128,\"max_num_batched_tokens\":8192,\"attention_backend\":\"TRITON_ATTN\"\}}"
+diff --git a/scripts/pack_training_code.py b/scripts/pack_training_code.py
+index caae09d..9d72aea 100644
+--- a/scripts/pack_training_code.py
++++ b/scripts/pack_training_code.py
+@@ -44,7 +44,7 @@ def main():
+         p.error('--run must contain flow.json from your own run')
+     if a.train_data and not all((a.train_data / n).exists() for n in ('questions.jsonl', 'answers.jsonl', 'data')):
+         p.error('--train-data must be a labeled train split')
+-    sources = [ROOT / 'training', ROOT / 'datamate', ROOT / 'docker', ROOT / 'assets', ROOT / 'scripts', ROOT / 'splits']
++    sources = [ROOT / 'training', ROOT / 'datamate', ROOT / 'docker', ROOT / 'assets', ROOT / 'scripts', ROOT / 'splits', ROOT / 'docs']
+     if a.run:
+         sources.append(a.run.resolve())
+     if a.train_data:
+@@ -53,6 +53,7 @@ def main():
+         p.error('--out must be outside the source directories being packaged')
+     out.mkdir(parents=True)
+     copy(ROOT / 'docker/training_code_README.md', out / 'README.md')
++    copy(ROOT / 'docs/docker-runbook.md', out / 'docker-runbook.md')
+     copy(ROOT / 'training/requirements.txt', out / 'requirements.txt')
+     copy(ROOT / 'docker/train.sh', out / 'train.sh')
+     for name in ('LICENSE', 'NOTICE.md'):
+diff --git a/docker/test_entrypoint.py b/docker/test_entrypoint.py
+new file mode 100644
+index 0000000..52d6b1f
+--- /dev/null
++++ b/docker/test_entrypoint.py
+@@ -0,0 +1,221 @@
++"""CPU checks for the real entrypoint shell, substituting only GPU discovery/model work.
++
++Run: .venv/bin/python -m pytest -q docker/test_entrypoint.py
++"""
++import json
++import os
++from pathlib import Path
++import signal
++import shutil
++import subprocess
++import sys
++import time
++
++import pytest
++
++from docker.verify_context import verify
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++@pytest.fixture
++def harness(tmp_path):
++    code, data, out, bin_dir = (tmp_path / name for name in ('code', 'data', 'result', 'bin'))
++    for path in (code, data, out, bin_dir):
++        path.mkdir()
++    (code / 'flags.sh').write_text((ROOT / 'scripts/flags.sh').read_text())
++    # Only relocate /code; all process management/finalization runs unchanged.
++    entrypoint = code / 'predict.sh'
++    entrypoint.write_text((ROOT / 'docker/predict.sh').read_text().replace('cd /code\n', f'cd "{code}"\n', 1))
++    qs = [{'id': f'q_{i}', 'business_id': f'shop_{i % 2}'} for i in range(4)]
++    (data / 'questions.jsonl').write_text(''.join(json.dumps(q) + '\n' for q in qs))
++    launcher = bin_dir / 'python3'
++    launcher.write_text(f'#!{sys.executable}\n' + '''
++import json, os, sys, time
++from pathlib import Path
++if sys.argv[1:3] != ['-m', 'datamate.predict']:
++    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
++from datamate.predict import parse_args
++from datamate.pipeline import load_questions
++from datamate.submission import write_submission, merge_shards
++a = parse_args(sys.argv[3:])
++assert a.k == 8 and a.think_k == 4 and a.quant == 'fp8' and a.lora is None
++assert a.debt_views and a.debt_route and a.canon_names and a.answer_unanswerable
++mode = os.environ['FAKE_MODE']
++if mode == 'failure':
++    sys.exit(7)
++qs, _ = load_questions(a)
++a.output.mkdir(parents=True, exist_ok=True)
++results = {q['id']: {'type': 'number', 'answer': 42} for q in (qs if mode == 'success' else qs[:1])}
++write_submission(a.output / 'submission.jsonl', qs, results)
++merge_shards(a.merge_into, a.data / 'questions.jsonl', shards=a.output.parent, copy_logs=False, quiet=True)
++(a.output / 'mock.json').write_text(json.dumps({'shard': a.shard, 'device': os.environ['CUDA_VISIBLE_DEVICES']}))
++if mode == 'success':
++    sys.exit(0)
++time.sleep(60)
++''')
++    launcher.chmod(0o755)
++    smi = bin_dir / 'nvidia-smi'
++    smi.write_text('#!/bin/bash\nprintf "%s" "${FAKE_GPUS}"\n')
++    smi.chmod(0o755)
++    env = {k: v for k, v in os.environ.items() if k not in (
++        'NUM_GPUS', 'CUDA_VISIBLE_DEVICES', 'LORA_DIR', 'THINK_K', 'QUANT', 'ENGINE', 'GPU_MEM')}
++    env.update(PATH=f'{bin_dir}:{env["PATH"]}', PYTHONPATH=str(ROOT), DATA_DIR=str(data), RESULT_DIR=str(out),
++               TIMEOUT_SECONDS='10', FAKE_MODE='success', FAKE_GPUS='GPU-A\nGPU-B\n')
++    return entrypoint, out, env
++
++
++def validate(out, answered):
++    rows = [json.loads(line) for line in (out / 'submission.jsonl').read_text().splitlines()]
++    assert [r['id'] for r in rows] == ['q_0', 'q_1', 'q_2', 'q_3']
++    assert sum(r['type'] != 'abstain' for r in rows) == answered
++    assert len(list((out / 'logs').glob('q_*.json'))) == 4
++
++
++@pytest.mark.parametrize('gpus', [1, 2])
++def test_shards_and_devices(harness, gpus):
++    script, out, env = harness
++    env['NUM_GPUS'] = str(gpus)
++    run = subprocess.run(['bash', str(script)], env=env, capture_output=True, text=True, timeout=20)
++    assert run.returncode == 0, run.stdout + run.stderr
++    validate(out, 4)
++    records = [json.loads(p.read_text()) for p in sorted(out.glob('work/run.*/shard*/mock.json'))]
++    assert [r['shard'] for r in records] == [f'{i}/{gpus}' for i in range(gpus)]
++    assert [r['device'] for r in records] == ['GPU-A', 'GPU-B'][:gpus]
++
++
++def test_masked_gpu_and_repeated_run(harness):
++    script, out, env = harness
++    env['CUDA_VISIBLE_DEVICES'] = 'GPU-X'
++    for mode, answered, status in [('success', 4, 0), ('failure', 0, 7)]:
++        env['FAKE_MODE'] = mode
++        run = subprocess.run(['bash', str(script)], env=env, capture_output=True, text=True, timeout=20)
++        assert run.returncode == status, run.stdout + run.stderr
++        validate(out, answered)
++    assert len(list(out.glob('work/run.*'))) == 2
++    assert json.loads(next(out.glob('work/run.*/shard0/mock.json')).read_text())['device'] == 'GPU-X'
++
++
++@pytest.mark.parametrize('setting,value,status', [('NUM_GPUS', '0', 2), ('NUM_GPUS', '3', 2),
++    ('NUM_GPUS', 'invalid', 2), ('TIMEOUT_SECONDS', '21601', 2), ('LORA_DIR', '/forbidden', 2), ('FAKE_GPUS', '', 2)])
++def test_startup_failure_leaves_submission(harness, setting, value, status):
++    script, out, env = harness
++    env[setting] = value
++    run = subprocess.run(['bash', str(script)], env=env, capture_output=True, text=True, timeout=20)
++    assert run.returncode == status, run.stdout + run.stderr
++    validate(out, 0)
++
++
++def test_timeout_keeps_partial_answers(harness):
++    script, out, env = harness
++    env.update(NUM_GPUS='2', TIMEOUT_SECONDS='2', FAKE_MODE='sleep')
++    run = subprocess.run(['bash', str(script)], env=env, capture_output=True, text=True, timeout=20)
++    assert run.returncode == 124, run.stdout + run.stderr
++    validate(out, 2)
++
++
++def test_term_keeps_partial_answers(harness):
++    script, out, env = harness
++    env.update(NUM_GPUS='1', FAKE_MODE='sleep')
++    process = subprocess.Popen(['bash', str(script)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    try:
++        deadline = time.monotonic() + 10
++        while not list(out.glob('work/run.*/shard0/mock.json')):
++            assert process.poll() is None
++            assert time.monotonic() < deadline
++            time.sleep(0.05)
++        process.send_signal(signal.SIGTERM)
++        stdout, stderr = process.communicate(timeout=20)
++        assert process.returncode == 143, stdout + stderr
++        validate(out, 1)
++    finally:
++        if process.poll() is None:
++            process.kill()
++            process.communicate()
++
++
++@pytest.fixture
++def context(tmp_path):
++    for name in ('docker/requirements.txt', 'training/requirements.txt', 'assets/fewshot_bank.jsonl',
++                 'docker/README.md', 'docker/predict.sh', 'scripts/flags.sh', 'docker/model_manifest.json',
++                 'LICENSE', 'NOTICE.md', 'datamate/__init__.py'):
++        target = tmp_path / name
++        target.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(ROOT / name, target)
++    subprocess.run([sys.executable, str(ROOT / 'scripts/pack_training_code.py'),
++                    '--out', str(tmp_path / 'build/training_code')], check=True, capture_output=True)
++    model = tmp_path / 'models/Qwen3.5-9B'
++    metadata = model / '.cache/huggingface/download'
++    metadata.mkdir(parents=True)
++    files = {'config.json': '{}', 'tokenizer.json': '{}', 'tokenizer_config.json': '{}',
++             'model.safetensors.index.json': json.dumps({'weight_map': {'test.weight': 'model-00001.safetensors'}}),
++             'model-00001.safetensors': 'synthetic-test-weight'}
++    revision = json.loads((ROOT / 'docker/model_manifest.json').read_text())['revision']
++    import hashlib
++    for name, content in files.items():
++        (model / name).write_text(content)
++        (metadata / f'{name}.metadata').write_text(f'{revision}\n{hashlib.sha256(content.encode()).hexdigest()}\n0\n')
++    return tmp_path, model
++
++
++def test_context_passes_then_rejects_wrong_revision(context):
++    root, model = context
++    verify(root)
++    (model / '.cache/huggingface/download/config.json.metadata').write_text('wrong-revision\n')
++    with pytest.raises(ValueError, match='revision mismatch'):
++        verify(root)
++
++
++def test_context_rejects_missing_weight(context):
++    root, model = context
++    (model / 'model-00001.safetensors').unlink()
++    with pytest.raises(ValueError, match='missing/empty model file'):
++        verify(root)
++
++
++def test_context_rejects_truncated_weight(context):
++    root, model = context
++    (model / 'model-00001.safetensors').write_text('truncated')
++    with pytest.raises(ValueError, match='checksum mismatch'):
++        verify(root)
++
++
++def test_context_rejects_adapter(context):
++    root, model = context
++    (model / 'adapter_config.json').write_text('{}')
++    with pytest.raises(ValueError, match='LoRA artifact must not ship'):
++        verify(root)
++
++
++def test_context_rejects_stale_flags(context):
++    root, _ = context
++    with (root / 'scripts/flags.sh').open('a') as stream:
++        stream.write('\n# changed after packing\n')
++    with pytest.raises(ValueError, match='is stale'):
++        verify(root)
++
++
++@pytest.mark.parametrize('gpus', [1, 2])
++def test_build_helper_gpu_selection_and_error_status(harness, gpus):
++    _, out, env = harness
++    fake_docker = Path(env['PATH'].split(':')[0]) / 'docker-mock'
++    fake_docker.write_text(f'#!{sys.executable}\n' + '''
++import json, os, sys
++from pathlib import Path
++record = Path(os.environ['DOCKER_CALLS'])
++with record.open('a') as stream:
++    stream.write(json.dumps(sys.argv[1:]) + '\\n')
++sys.exit(7 if '/code/predict.sh' in sys.argv else 0)
++''')
++    fake_docker.chmod(0o755)
++    calls = out.parent / 'docker-calls.jsonl'
++    env.update(DOCKER=str(fake_docker), DATA=env['DATA_DIR'], RESULT=str(out),
++               NUM_GPUS=str(gpus), DOCKER_CALLS=str(calls))
++    run = subprocess.run(['bash', str(ROOT / 'docker/build.sh'), 'test', '20'],
++                         env=env, capture_output=True, text=True, timeout=20)
++    assert run.returncode == 7, run.stdout + run.stderr
++    inference, check = [json.loads(line) for line in calls.read_text().splitlines()]
++    assert inference[inference.index('--gpus') + 1] == ('"device=0"' if gpus == 1 else '"device=0,1"')
++    assert inference[-3:] == ['/code/predict.sh', '--limit', '20']
++    assert f'NUM_GPUS={gpus}' in inference
++    assert '--network' in check and 'datamate.submission' in check
+diff --git a/docker/verify_context.py b/docker/verify_context.py
+new file mode 100644
+index 0000000..48bd2f8
+--- /dev/null
++++ b/docker/verify_context.py
+@@ -0,0 +1,79 @@
++"""CPU-only, offline preflight for the base-only submission's Docker COPY inputs."""
++from __future__ import annotations
++
++import hashlib
++import json
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def sha256(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open('rb') as stream:
++        for chunk in iter(lambda: stream.read(4 << 20), b''):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def verify(root: Path = ROOT) -> None:
++    manifest = json.loads((root / 'docker/model_manifest.json').read_text())
++    if manifest['lora_adapter'] is not None:
++        raise ValueError('submission requires lora_adapter=null')
++    # Every explicit Dockerfile COPY source (directories checked separately below).
++    for name in ('docker/requirements.txt', 'training/requirements.txt',
++                 'assets/fewshot_bank.jsonl', 'docker/README.md', 'docker/predict.sh',
++                 'scripts/flags.sh', 'docker/model_manifest.json', 'LICENSE', 'NOTICE.md',
++                 'datamate/__init__.py', 'build/training_code/data_manifest.json'):
++        if not (root / name).is_file() or not (root / name).stat().st_size:
++            raise ValueError(f'missing {name}; download the pinned model and run docker/build.sh pack')
++    model = root / 'models/Qwen3.5-9B'
++    required = {'config.json', 'tokenizer.json', 'tokenizer_config.json', 'model.safetensors.index.json'}
++    index = model / 'model.safetensors.index.json'
++    if not index.is_file():
++        raise ValueError(f'missing {index}; download the pinned model first')
++    required.update(json.loads(index.read_text())['weight_map'].values())
++    for name in sorted(required):
++        path = model / name
++        if not path.is_file() or not path.stat().st_size:
++            raise ValueError(f'missing/empty model file: {path}')
++        # `hf download --revision ... --local-dir ...` records its commit here.
++        metadata = model / '.cache/huggingface/download' / f'{name}.metadata'
++        if not metadata.is_file():
++            raise ValueError(f'missing download provenance: {metadata}; rerun the pinned hf download')
++        lines = metadata.read_text().splitlines()
++        if not lines or lines[0] != manifest['revision']:
++            raise ValueError(f'model revision mismatch: {path}')
++        # LFS etags are SHA-256; check complete weight contents, not just filenames.
++        if name.endswith('.safetensors'):
++            if len(lines) < 2 or len(lines[1]) != 64 or sha256(path) != lines[1]:
++                raise ValueError(f'model weight checksum mismatch: {path}')
++    package = root / 'build/training_code'
++    packed = json.loads((package / 'data_manifest.json').read_text())
++    if packed['model'] != manifest:
++        raise ValueError('packed model manifest is stale; repack training code')
++    if packed.get('own_run_evidence_included') or packed.get('train_data_included'):
++        raise ValueError('submission requires the default source-only training package; repack without options')
++    for item in packed['files']:
++        path = package / item['path']
++        if not path.is_file() or path.stat().st_size != item['bytes'] or sha256(path) != item['sha256']:
++            raise ValueError(f'training package checksum mismatch: {path}')
++    for src, dst in (('scripts/flags.sh', 'configs/flags.sh'),
++                     ('assets/fewshot_bank.jsonl', 'data/fewshot_bank.jsonl')):
++        if sha256(root / src) != sha256(package / dst):
++            raise ValueError(f'packed {src} is stale; repack training code')
++    for directory in (model, package):
++        for path in directory.rglob('*'):
++            if path.name == 'adapter_config.json' or path.name.startswith('adapter_model.') or 'sql_rft_v3' in path.parts:
++                raise ValueError(f'LoRA artifact must not ship: {path}')
++    print(f'context OK: pinned {manifest["revision"]}, {len(required)} model files, '
++          f'{len(packed["files"])} verified package files; no LoRA artifacts')
++
++
++if __name__ == '__main__':
++    try:
++        verify()
++    except (OSError, ValueError, KeyError) as exc:
++        print(f'context ERROR: {exc}', file=sys.stderr)
++        sys.exit(1)
+diff --git a/docs/docker-runbook.md b/docs/docker-runbook.md
+new file mode 100644
+index 0000000..411fc34
+--- /dev/null
++++ b/docs/docker-runbook.md
+@@ -0,0 +1,93 @@
++# Chạy và xuất Docker DataMate
++
++Máy Linux x86-64 có Docker, NVIDIA Container Toolkit, Python 3 (venv), GNU time, GPU hỗ trợ fp8 **≥24 GB mỗi GPU** và khoảng **80 GB đĩa trống**. Có mạng khi tải/build; suy luận tắt mạng. Máy thi là **2×RTX 5090 32 GB**, tối đa **6 giờ gồm tải model**. GPU 24 GB cần smoke test thực tế; hai GPU chạy hai bản model độc lập. Máy chuẩn bị hiện tại không có Docker, chỉ RTX 3050 4 GB nên chưa xác nhận image/GPU.
++
++Chạy từ thư mục repo, theo thứ tự; thay đường dẫn repo và public test cho máy đích:
++
++```bash
++cd /path/to/datamate-agent-Locked-In1
++set -euo pipefail
++export TEAM=locked-in1
++export DATA=/path/to/public_test
++export NUM_GPUS=1                 # đặt 2 khi máy có đủ hai GPU
++export TIMEOUT_SECONDS=21000
++IMAGE="zaic2026_datamate_${TEAM}:final"
++docker version
++docker info
++nvidia-smi
++df -h .
++docker system df
++ls "$DATA/questions.jsonl" "$DATA/rulebook.md" "$DATA/calendar.csv" "$DATA/data"
++```
++
++Cần thấy Docker server hoạt động, GPU đúng VRAM và đủ dữ liệu. Nếu Docker dùng phân vùng khác, kiểm tra dung lượng phân vùng đó bằng `df -h "$(docker info --format '{{.DockerRootDir}}')"`.
++
++**1. Tải đúng revision** (không tải adapter):
++
++```bash
++python3 -m venv .venv-download
++.venv-download/bin/python -m pip install huggingface_hub
++HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 .venv-download/bin/hf download Qwen/Qwen3.5-9B \
++  --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a \
++  --local-dir models/Qwen3.5-9B
++du -sh models/Qwen3.5-9B
++```
++
++Phải tải xong tất cả safetensors, index, tokenizer/config. Giữ metadata `.cache/huggingface/download/` để preflight kiểm tra revision và SHA-256 weights. Lệnh theo [tài liệu CLI Hugging Face](https://huggingface.co/docs/huggingface_hub/guides/cli).
++
++**2. Pack và build:**
++
++```bash
++# Nếu pack cũ tồn tại: mv build/training_code "build/training_code.prev.$(date +%s)"
++bash docker/build.sh pack
++python3 docker/verify_context.py
++bash docker/build.sh build
++docker run --rm --gpus all --network none --entrypoint nvidia-smi "$IMAGE"
++docker run --rm --network none --entrypoint python3 "$IMAGE" -m pip check
++```
++
++Pack in số file và `own run evidence: False`; preflight phải in `context OK ... no LoRA artifacts`. Build thành công in `linux/amd64 <bytes>` và cây `/code`, có model/source/few-shot/training code. Lệnh `nvidia-smi` trong image phải thấy GPU; `pip check` phải không báo xung đột. Venv train không cài trong image nộp base-only để tiết kiệm đĩa; source train luôn có.
++
++**3. Smoke 20 câu, rồi full public có đo wall-clock:**
++
++```bash
++export RESULT="$PWD/result_smoke_$(date +%Y%m%d_%H%M%S)"
++bash docker/build.sh test 20 2>&1 | tee smoke-docker.log
++export RESULT="$PWD/result_public_$(date +%Y%m%d_%H%M%S)"
++/usr/bin/time -f 'elapsed_seconds=%e exit=%x' -o public-docker.time \
++  bash docker/build.sh test 2>&1 | tee public-docker.log
++cat public-docker.time
++find "$RESULT/work" -name run.json -exec cat {} +
++```
++
++Mỗi `RESULT` phải mới/rỗng. Cần thấy mỗi shard `model ready`, `loaded ... shops`, `shard... exited 0`, cuối cùng `format OK` và `exit=0`. Smoke chỉ xử lý 20 câu nhưng submission vẫn đủ ID; full public cần đủ 1000 câu trong tổng `questions` của các `run.json`, tổng thời gian **<21600 giây**, không traceback/OOM/timeout. `TIMEOUT_SECONDS=21000` dành khoảng 10 phút cho finalize trước hạn; tiến trình trả 124 hoặc 143 phải điều tra log dù JSON còn hợp lệ. Kiểm tra số ID, số câu có đáp án và log chưa xử lý:
++
++```bash
++python3 - <<'PY'
++import json, os
++from collections import Counter
++from pathlib import Path
++out = Path(os.environ['RESULT'])
++qs = [json.loads(s)['id'] for s in (Path(os.environ['DATA'])/'questions.jsonl').read_text(encoding='utf-8-sig').splitlines() if s.strip()]
++rows = [json.loads(s) for s in (out/'submission.jsonl').read_text().splitlines()]
++assert Counter(r['id'] for r in rows) == Counter(qs)
++runs = [json.loads(p.read_text()) for p in (out/'work').rglob('run.json')]
++assert sum(r['questions'] for r in runs) == len(qs), 'Thiếu câu/shard hoàn tất'
++unprocessed = sum('not processed:' in p.read_text() for p in (out/'logs').glob('q_*.json'))
++print('IDs:', len(rows), '| types:', Counter(r['type'] for r in rows), '| not processed:', unprocessed)
++PY
++```
++
++`not processed: 0` là dấu hiệu không còn log dự phòng; `abstain` vẫn có thể là quyết định của pipeline. PA chỉ lấy từ chấm có nhãn/portal, không suy ra từ `format OK`. Cấu hình đã chọn là base Qwen3.5-9B, **không LoRA, k=8, think-k=4, fp8**, bank `assets/fewshot_bank.jsonl`; không đổi cờ để đo lại cấu hình này.
++
++**4. Xuất sau khi full test đạt:**
++
++```bash
++bash docker/build.sh export
++md5sum -c "zaic2026_datamate_${TEAM}.tar.gz.md5"
++ls -lh "zaic2026_datamate_${TEAM}.tar.gz"*
++```
++
++Phải có `.tar.gz`, `.tar.gz.md5`, `uncompressed .tar bytes: ...` và checksum `OK`. Export nén streaming, không giữ thêm bản `.tar` thô. Để chứng minh archive dùng offline, có thể chuyển archive sang máy Docker+GPU khác, chạy `docker load -i ...tar.gz` rồi lặp smoke với `--network none` qua helper.
++
++Dung lượng/thời gian là **ước lượng chưa đo image**: BF16 weights khoảng **19–20 GB** (9.65B tham số ×2 byte); source pack <2 MB; image có thể khoảng **35–50+ GB**, archive khoảng **20–35+ GB**, phụ thuộc base/libraries. **80 GB khá sát** vì đồng thời giữ model, image, build cache và archive; kiểm tra `df`/`docker system df` sau build và trước export, dùng thêm ổ đĩa nếu thiếu, không tự xóa image/cache khác. Tải 20 GB ở 100 Mbps tối thiểu khoảng 27 phút; build khoảng 15–60+ phút tùy mạng/CPU/cache; pack vài giây; export khoảng 5–30+ phút tùy đĩa/CPU. Mốc public do người dùng cung cấp: **1000 câu ≈100 phút trên một RTX PRO 6000 96 GB** với cấu hình này; README tham chiếu ghi **≈3.5 giờ trên một GPU 24 GB**. Smoke 20 câu có thể 5–20+ phút vì vẫn tải model/dựng lớp shop. Đây không phải số đo RTX 5090; full test thực tế mới chứng minh hạn 6 giờ.

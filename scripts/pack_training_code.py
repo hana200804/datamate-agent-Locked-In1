@@ -44,7 +44,7 @@ def main():
         p.error('--run must contain flow.json from your own run')
     if a.train_data and not all((a.train_data / n).exists() for n in ('questions.jsonl', 'answers.jsonl', 'data')):
         p.error('--train-data must be a labeled train split')
-    sources = [ROOT / 'training', ROOT / 'datamate', ROOT / 'docker', ROOT / 'assets', ROOT / 'scripts', ROOT / 'splits']
+    sources = [ROOT / 'training', ROOT / 'datamate', ROOT / 'docker', ROOT / 'assets', ROOT / 'scripts', ROOT / 'splits', ROOT / 'docs']
     if a.run:
         sources.append(a.run.resolve())
     if a.train_data:
@@ -53,6 +53,7 @@ def main():
         p.error('--out must be outside the source directories being packaged')
     out.mkdir(parents=True)
     copy(ROOT / 'docker/training_code_README.md', out / 'README.md')
+    copy(ROOT / 'docs/docker-runbook.md', out / 'docker-runbook.md')
     copy(ROOT / 'training/requirements.txt', out / 'requirements.txt')
     copy(ROOT / 'docker/train.sh', out / 'train.sh')
     for name in ('LICENSE', 'NOTICE.md'):

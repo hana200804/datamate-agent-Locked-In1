@@ -66,3 +66,53 @@ def block(rows):
     for r in rows:
         text += f"\nQ: {r['question']}\nTYPE: {r['type']}\n```sql\n{r['sql']}\n```"
     return text
+
+
+def nearest(question, rows, k, text=lambda r: r["question"], floor=0.0):
+    """The k rows closest to the question (same features and IDF weighting as Bank, IDF taken over these rows), best first."""
+    if not rows or k <= 0:
+        return []
+    fs = [feats(text(r)) for r in rows]
+    df = Counter(x for f in fs for x in f)
+    idf = {x: math.log(1 + len(rows) / v) for x, v in df.items()}
+    f = feats(question)
+    nq = math.sqrt(sum((c * idf.get(x, 1.0)) ** 2 for x, c in f.items())) or 1.0
+    scored = []
+    for i, g in enumerate(fs):
+        ng = math.sqrt(sum((c * idf[x]) ** 2 for x, c in g.items())) or 1.0
+        scored.append((sum(c * g[x] * idf[x] ** 2 for x, c in f.items() if x in g) / (nq * ng), i))
+    return [rows[i] for sc, i in sorted(scored, reverse=True)[:k] if sc > floor]
+
+
+def self_block(rows):
+    """Questions of this same shop that every sample agreed on, as examples for its harder questions (no gold answer involved)."""
+    if not rows:
+        return ""
+    text = ("SOLVED QUESTIONS OF THIS SHOP (same tables, values and rules as the question below; every sample agreed on them. "
+            "Reuse how they read this shop's tables, never their dates or values):")
+    for r in rows:
+        text += f"\nQ: {r['question']}\nTYPE: {r['type']}\n```sql\n{r['sql']}\n```"
+    return text
+
+
+def rule_rows(rulebook):
+    """The rulebook's table rows, each with the heading it sits under: [{"section", "row", "key"}]."""
+    out, section = [], ""
+    for line in rulebook.splitlines():
+        t = line.strip()
+        if t.startswith("#"):
+            section = t.lstrip("# ").strip()
+        elif t.startswith("|") and not re.fullmatch(r"[|\s:-]+", t):
+            cells = [c.strip() for c in t.strip("|").split("|")]
+            if len(cells) >= 2 and cells[0] not in ("Luật", "Cách nói", "Từ", "Kiểu"):
+                out.append({"section": section, "row": t, "key": cells[0] + " " + section})
+    return out
+
+
+def rule_block(question, rules, k):
+    """The k rulebook rows whose first cell is closest to the question, repeated next to it (the whole RULEBOOK stays in the system message)."""
+    hit = nearest(question, rules, k, text=lambda r: r["key"], floor=0.08)
+    if not hit:
+        return ""
+    return ("RULEBOOK ROWS CLOSEST TO THIS QUESTION (repeated from the RULEBOOK, which applies in full):\n"
+            + "\n".join(f"[{r['section']}] {r['row']}" for r in hit))

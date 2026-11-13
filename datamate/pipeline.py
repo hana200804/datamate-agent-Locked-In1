@@ -22,7 +22,7 @@ from .ingest import entity_hits, load_business, norm, profile, schema_text
 from .prompts import NOTES, SYSTEM, SYSTEM_ALT, chat, repair_hint
 from .sqlexec import execute, parse
 from .submission import merge_shards, write_submission
-from .voting import debt_pool, final_answer, top_votes, vote
+from .voting import answer_key, debt_pool, decide, final_answer, top_votes, vote
 
 
 def load_questions(a):
@@ -61,6 +61,7 @@ class Pipeline:
         base_prompts = (SYSTEM, SYSTEM) if a.fewshot else (SYSTEM, SYSTEM_ALT)
         self.systems = [s + "\n\nRULEBOOK:\n" + self.rulebook for s in base_prompts]
         self.bank = fewshot.Bank(a.fewshot) if a.fewshot else None
+        self.rules = fewshot.rule_rows(self.rulebook) if getattr(a, "rule_hints", 0) else []
         self.half = a.k // 2
         self.vtexts, self.vchecked, self.vfixed = {}, {}, {}
         self.dchecked, self.dfixed = {}, {}
@@ -306,11 +307,20 @@ class Pipeline:
         behind = is_behind()
         debt_q = [bool(shop.debt) and a.debt_route and bool(DEBT_WORDS.search(norm(q["question"]))) for q in todo]
         if a.think_k and not behind:  # adaptive compute: low-agreement questions, and debt questions (thinking samples are the ones calling the macros), get thinking-mode samples
-            hard = [i for i, ps in enumerate(preds) if texts[i] and (debt_q[i] or vote(ps, len(ps))[1] < a.think_below)]
-            if hard:
+            pool_of = lambda i: debt_pool(texts[i], 2 * half, debt_q[i]) if a.debt_route else list(range(len(texts[i])))
+            share = lambda i: vote([preds[i][j] for j in pool_of(i)], len(pool_of(i)))
+            for rnd in range(max(1, getattr(a, "think_rounds", 1))):
+                if rnd == 0:
+                    hard = [i for i, ps in enumerate(preds) if texts[i] and (debt_q[i] or vote(ps, len(ps))[1] < a.think_below)]
+                else:  # later rounds: what the vote so far still leaves open
+                    hard = [i for i in hard if share(i)[1] < a.think_below]
+                if not hard or (rnd and is_behind()):
+                    break
+                solved = self.solved(todo, texts, preds, share) if getattr(a, "self_shots", 0) else {}
+                start = {i: len(texts[i]) for i in hard}
                 # with examples available all thinking samples get them: right 86% vs 71.5% on 873 hard train questions
-                hchats = [chats[i][1 if bank else s % len(systems)] for i in hard for s in range(a.think_k)]
-                houts = eng.chat(hchats, eng.params(n=1, temperature=0.6, top_p=0.95, top_k=20, max_tokens=a.think_budget + a.max_tokens, seed=a.seed),
+                hchats = [self.think_chat(shop, todo, chats, i, s, solved) for i in hard for s in range(a.think_k)]
+                houts = eng.chat(hchats, eng.params(n=1, temperature=0.6, top_p=0.95, top_k=20, max_tokens=a.think_budget + a.max_tokens, seed=a.seed + rnd),
                                  thinking=True, lora=a.lora_thinking)
                 for n, o in enumerate(houts):
                     i, t = hard[n // a.think_k], o.outputs[0].text
@@ -324,9 +334,43 @@ class Pipeline:
                         preds[i].append(None); errs[i].append(str(e)[:400])
                 # failed thinking samples get the same repair turns (non-thinking). A cut-off thought has no query to fix
                 n_repair += self._repair(shop, todo, chats, texts, preds, errs,
-                                         [(i, j) for i in hard for j in range(2 * half, len(texts[i])) if preds[i][j] is None and "</think>" in texts[i][j]], prompt_idx)
+                                         [(i, j) for i in hard for j in range(start[i], len(texts[i])) if preds[i][j] is None and "</think>" in texts[i][j]], prompt_idx)
         pools = [debt_pool(ts, 2 * half, dq) if a.debt_route else list(range(len(ts))) for ts, dq in zip(texts, debt_q)]
         return texts, preds, errs, pools, len(repair), n_repair, behind
+
+    def solved(self, todo, texts, preds, share):
+        """Questions of this shop the samples agree on (share >= --self-conf, an answer decide() would give): {i: example row}.
+        The SQL is the first sample's that gave the voted answer. No gold answer is read."""
+        out = {}
+        for i, q in enumerate(todo):
+            if not texts[i]:
+                continue
+            ans, conf = share(i)
+            if conf < self.a.self_conf or not decide(ans, conf, self.a.threshold):
+                continue
+            key = answer_key(ans)
+            for t, p in zip(texts[i], preds[i]):
+                if p and answer_key(p) == key:
+                    typ, sql = parse(t.split("\n#REPAIR\n")[-1])
+                    if sql and len(sql) < 3000:
+                        out[i] = {"question": q["question"], "type": typ or ans["type"], "sql": sql}
+                        break
+        return out
+
+    def think_chat(self, shop, todo, chats, i, s, solved):
+        """The chat of thinking sample s of question i: the usual one, plus (when asked) the closest rulebook rows and this shop's
+        solved questions. Falls back to the usual chat when the longer one does not fit the context."""
+        a, bank = self.a, self.bank
+        base = chats[i][1 if bank else s % len(self.systems)]
+        q = todo[i]
+        extra = [fewshot.rule_block(q["question"], self.rules, a.rule_hints) if self.rules else "",
+                 fewshot.self_block(fewshot.nearest(q["question"], [r for j, r in solved.items() if j != i], a.self_shots)) if solved else ""]
+        extra = [x for x in extra if x]
+        if not extra:
+            return base
+        shots = fewshot.block(bank.retrieve(q["question"], shop.name, a.fewshot_k, debt=bool(shop.debt))) if bank and shop.view else ""
+        c = chat(base[0]["content"], shop.ctx, q, "\n\n".join(x for x in [shots, *extra] if x))
+        return c if self.engine.n_tokens(c) <= a.context - a.think_budget - a.max_tokens - 64 else base
 
     def decide(self, todo, preds, pools):
         """(final, vote, confidence) per question."""

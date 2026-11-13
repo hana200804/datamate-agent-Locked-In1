@@ -1,31 +1,68 @@
 #!/usr/bin/env bash
-# Entry point of the image: bash /code/predict.sh, no arguments (organizers' Docker guide, section 5). All settings are fixed in
-# /code/flags.sh. Reads /data (read-only); writes into /result:
-#   submission.jsonl  every question id; rewritten after each shop by every process, so answers saved before a stop still count
-#   logs/<id>.json    one log record per question on one line: id, answer, elapsed_ms, thinking, code, output (+ the full trace)
-#   work/shard<i>/    per-GPU working files: the shop layers (views, debt macros) the SQL reads, trace.jsonl, process log
-# One datamate.predict process per GPU (data parallel over shops, no tensor parallelism, so no NCCL traffic between the GPUs).
-# Each process stops itself at TIMEOUT_SECONDS (5 h 50 min), below the 6 h limit that includes model loading.
-set -uo pipefail
+# Offline entrypoint: one process per GPU, shops split over 1 or 2 GPUs.
+# Each process saves/merges after every shop. Initialize all-abstain output
+# before GPU/model startup, and finalize it on timeout, worker failure or TERM.
+set -euo pipefail
 cd /code
 source ./flags.sh
 DATA="${DATA_DIR:-/data}" OUT="${RESULT_DIR:-/result}"
-NG="${NUM_GPUS:-$(nvidia-smi -L | wc -l)}"
 T="${TIMEOUT_SECONDS:-21000}"
-LORA=(); [ -z "${LORA_DIR:-}" ] || LORA=(--lora "$LORA_DIR" --lora-thinking)
-mkdir -p "$OUT/logs" "$OUT/work"
 start=$(date +%s)
-echo "datamate: $NG GPU(s), $(grep -c . "$DATA/questions.jsonl") questions, timeout ${T}s"
-for i in $(seq 0 $((NG - 1))); do
-  CUDA_VISIBLE_DEVICES=$i timeout --signal=TERM --kill-after=15s "${T}s" \
-    python3 -m datamate.predict --data "$DATA" --output "$OUT/work/shard$i" --shard "$i/$NG" --deadline "$(( T - 900 ))" \
-    --log-dir "$OUT/logs" --merge-into "$OUT" \
-    --model /code/models/Qwen3.5-9B "${LORA[@]}" --fewshot /code/assets/fewshot_bank.jsonl \
-    "${DATAMATE_FLAGS[@]}" --engine "$DATAMATE_ENGINE" "$@" > "$OUT/work/shard$i.log" 2>&1 &
+mkdir -p "$OUT/work"
+# A new shard root prevents answers from an earlier run entering this submission.
+WORK=$(mktemp -d "$OUT/work/run.XXXXXXXX")
+if [ -d "$OUT/logs" ]; then mv "$OUT/logs" "$WORK/previous-logs"; fi
+mkdir -p "$OUT/logs"
+pids=()
+finalize() {
+  local status=$? pid
+  trap - EXIT TERM INT
+  for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  python3 -m datamate.submission merge "$OUT" --shards "$WORK" --no-copy-logs --questions "$DATA/questions.jsonl" || status=1
+  python3 -m datamate.submission fill-logs "$OUT/logs" --questions "$DATA/questions.jsonl" || status=1
+  python3 -m datamate.submission check "$OUT/submission.jsonl" --questions "$DATA/questions.jsonl" || status=1
+  grep -h -E 'model ready|loaded [0-9]+ shops|view drafts|debt drafts' "$WORK"/shard*.log || true
+  echo "datamate: done in $(( $(date +%s) - start ))s, status $status; work $WORK"
+  exit "$status"
+}
+# This also checks that the input question IDs are readable before any GPU work.
+python3 -m datamate.submission merge "$OUT" --shards "$WORK" --no-copy-logs --questions "$DATA/questions.jsonl"
+trap finalize EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+[[ "$T" =~ ^[1-9][0-9]*$ ]] && (( T <= 21000 )) || { echo 'TIMEOUT_SECONDS must be 1..21000' >&2; exit 2; }
+# The submission runs only the base model, even when the host has a LoRA env var.
+[ -z "${LORA_DIR:-}" ] || { echo 'Submission image does not accept LORA_DIR' >&2; exit 2; }
+for arg in "$@"; do
+  case "$arg" in --lora|--lora=*|--lora-thinking) echo 'Submission image does not accept LoRA flags' >&2; exit 2;; esac
 done
-wait
-python3 -m datamate.submission merge "$OUT" --shards "$OUT/work" --no-copy-logs --questions "$DATA/questions.jsonl"
-python3 -m datamate.submission fill-logs "$OUT/logs" --questions "$DATA/questions.jsonl"
-python3 -m datamate.submission check "$OUT/submission.jsonl" --questions "$DATA/questions.jsonl" || true
-grep -h -E "model ready|loaded [0-9]+ shops|view drafts|debt drafts" "$OUT"/work/shard*.log || true
-echo "datamate: done in $(( $(date +%s) - start ))s, $(ls "$OUT/logs" | wc -l) question logs"
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  IFS=, read -ra devices <<< "$CUDA_VISIBLE_DEVICES"
+else
+  gpu_list=$(nvidia-smi --query-gpu=uuid --format=csv,noheader) || { echo 'Cannot enumerate GPUs' >&2; exit 1; }
+  devices=()
+  while IFS= read -r device; do [ -z "$device" ] || devices+=("$device"); done <<< "$gpu_list"
+fi
+available=${#devices[@]}
+NG="${NUM_GPUS:-$(( available > 2 ? 2 : available ))}"
+[[ "$NG" =~ ^[12]$ ]] && (( NG <= available )) || { echo "Need 1 or 2 visible GPUs; requested $NG, visible $available" >&2; exit 2; }
+deadline=$(( T > 900 ? T - 900 : 1 ))
+echo "datamate: $NG GPU(s), timeout ${T}s (includes model load), work $WORK"
+for ((i=0; i<NG; i++)); do
+  CUDA_VISIBLE_DEVICES="${devices[i]}" timeout --signal=TERM --kill-after=15s "${T}s" \
+    python3 -m datamate.predict --data "$DATA" --output "$WORK/shard$i" --shard "$i/$NG" --deadline "$deadline" \
+    --log-dir "$OUT/logs" --merge-into "$OUT" \
+    --model /code/models/Qwen3.5-9B --fewshot /code/assets/fewshot_bank.jsonl \
+    "${DATAMATE_FLAGS[@]}" --engine "$DATAMATE_ENGINE" "$@" > "$WORK/shard$i.log" 2>&1 &
+  pids+=("$!")
+done
+status=0
+for i in "${!pids[@]}"; do
+  worker_status=0
+  wait "${pids[i]}" || worker_status=$?
+  echo "datamate: shard$i exited $worker_status"
+  if (( worker_status != 0 )); then status=$worker_status; fi
+done
+pids=()
+exit "$status"

@@ -13,12 +13,12 @@
   "total_parameters_with_adapter": 9653104368,
   "vllm": "0.32.0",
   "dtype": "bfloat16 weights, fp8 online quantization",
-  "enable_thinking": "Per-shop view and debt drafts; additional question samples controlled by THINK_K (default 0).",
+  "enable_thinking": "Per-shop view and debt drafts; additional question samples controlled by THINK_K (default 4).",
   "temperature": "0.7 SQL samples; 0.6 / top_k 20 thinking; greedy repairs",
   "seed": 0,
   "language_model_only": true,
   "gpu_validated": false,
-  "note": "DataMate Agent Locked-In1 uses the pinned base model by default. An own trained adapter may be mounted using LORA_DIR. This Docker image has not been GPU-validated after repository cleanup.",
+  "note": "Submission configuration: pinned base model, no LoRA, k=8, think-k=4, assets/fewshot_bank.jsonl. This Docker image has not been GPU-validated after repository cleanup.",
   "base_model_path_in_image": "/code/models/Qwen3.5-9B",
   "training_only_models": []
 }

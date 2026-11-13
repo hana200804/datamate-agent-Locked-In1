@@ -22,8 +22,8 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-STAGES = ("setup", "preflight", "generate", "sft", "notes", "train", "public")
-TRAIN_STAGES = STAGES[:-1]  # "all" = train flow; "public" only runs when named
+STAGES = ("setup", "preflight", "generate", "sft", "notes", "train", "holdout", "public")
+TRAIN_STAGES = STAGES[:6]  # "all" = train flow; "holdout" and "public" only run when named
 
 
 def arguments(argv=None):
@@ -45,6 +45,9 @@ def arguments(argv=None):
     p.add_argument("--max-rows", type=int, default=4000)
     p.add_argument("--easy", type=int, default=800)
     p.add_argument("--public-think-k", type=int, default=4, help="public stage: thinking samples per hard/debt question (0 = faster, weaker)")
+    p.add_argument("--holdout-think-k", default="0,4", help="holdout stage: comma list of --think-k values; later runs reuse the first run's views")
+    p.add_argument("--extra-flags", default="", help="holdout/public stages: extra datamate.predict flags, e.g. '--think-rounds 2 --self-shots 3'")
+    p.add_argument("--public-shops", default="", help="public stage: only these shops (comma list), for a diagnosis run; the rest stay abstain")
     p.add_argument("--public-lora", type=Path, help="public stage: own adapter dir; default none = base model")
     p.add_argument("--dry-run", action="store_true", help="print all selected commands; no GPU checks, writes, installs or model imports")
     a = p.parse_args(argv)
@@ -311,12 +314,32 @@ class Flow:
         temp.replace(self.pool / "trace.jsonl")
         atomic_json(marker, {"questions": len(qs), "shops": len({q['business_id'] for q in qs})})
 
+    def holdout(self):
+        """splits/holdout600 (6 train shops never used as examples of their own questions): one run per --think-k, scored
+        against train gold by datamate.holdout_report. Later runs reuse the first run's views and debt layer (--views-from)."""
+        ids, first = ROOT / "splits/holdout600.txt", None
+        for k in [int(x) for x in self.a.holdout_think_k.split(",") if x.strip()]:
+            dest = self.out / "holdout" / f"think{k}"
+            flags = list(self.gpu_flags())
+            flags[flags.index("--think-k") + 1] = str(k)
+            flags += shlex.split(self.a.extra_flags)
+            if first is not None:
+                flags += ["--views-from", first]
+            if self.a.dry_run or not (dest / "run.json").exists():
+                self.run(self.predict_cmd(dest, ids, flags=flags), f"holdout-think{k}", startup=True)
+            else:
+                print(f"skip completed holdout think{k}", flush=True)
+            self.run([self.py, "-m", "datamate.holdout_report", "--trace", dest / "trace.jsonl", "--data", self.a.data / "train",
+                      "--label", f"think{k}"], f"holdout-report-think{k}")
+            first = first or dest
+
     def public(self):
         """1000 public questions -> public/submission.jsonl for the portal; resumes by shop like generate."""
         dest, split = self.out / "public", "public_test"
         qfile = self.a.data / split / "questions.jsonl"
         flags = list(self.gpu_flags())
         flags[flags.index("--think-k") + 1] = str(self.a.public_think_k)
+        flags += shlex.split(self.a.extra_flags)
         lora = []
         if self.a.public_lora:
             lora = ["--lora", self.a.public_lora, "--lora-thinking"]
@@ -327,7 +350,8 @@ class Flow:
             raise RuntimeError(f"Missing {qfile}; upload public_test.zip next to train.zip")
         qs = list(rows(qfile))
         complete = self.collect(qs, dest)
-        pending = [q["id"] for q in qs if q["id"] not in complete]
+        only = {x.strip() for x in self.a.public_shops.split(",") if x.strip()}
+        pending = [q["id"] for q in qs if q["id"] not in complete and (not only or q["business_id"] in only)]
         dest.mkdir(parents=True, exist_ok=True)
         (dest / "pending.txt").write_text("\n".join(pending) + "\n")
         print(f"public: {len(complete)}/{len(qs)} done in full shops; {len(pending)} pending; think-k {self.a.public_think_k}; "
@@ -353,7 +377,27 @@ class Flow:
         nl = raw.count(b"\n")
         print(f"SUBMISSION-B64-BEGIN lines={nl} md5={hashlib.md5(raw).hexdigest()}\n"
               + "\n".join(textwrap.wrap(b64, 120)) + "\nSUBMISSION-B64-END", flush=True)
-        if len(complete) != len(qs):
+        # per-question diagnosis without gold: vote share, the answers the samples gave, the SQL behind the voted answer
+        diag = []
+        for q in qs:
+            r = complete.get(q["id"])
+            if not r:
+                continue
+            groups = {}
+            for smp in r.get("samples", []):
+                k = json.dumps(smp.get("pred"), ensure_ascii=False, default=str)[:80] if smp.get("pred") else "ERR " + str(smp.get("error"))[:60]
+                groups[k] = groups.get(k, 0) + 1
+            vote_dump = json.dumps(r.get("vote"), ensure_ascii=False, default=str)[:80]
+            sql = next((re.findall(r"```(?:sql)?\s*(.*?)```", smp["text"].split("</think>")[-1], re.S) or [""] for smp in r.get("samples", [])
+                        if smp.get("pred") and json.dumps(smp["pred"], ensure_ascii=False, default=str)[:80] == vote_dump), [""])[-1]
+            diag.append({"id": q["id"], "biz": q["business_id"], "q": q["question"][:160], "final": r["final"].get("type"), "conf": round(float(r.get("conf") or 0), 3),
+                         "n": len(r.get("samples", [])), "groups": sorted(groups.items(), key=lambda x: -x[1])[:8], "sql": sql[:1500]})
+        for f in sorted(dest.glob("attempt-*/logs/_*.json")):  # the view and debt layer each shop got
+            diag.append({"layer": f.name, "text": f.read_text(encoding="utf-8")[:12000]})
+        draw = ("\n".join(json.dumps(x, ensure_ascii=False, separators=(",", ":")) for x in diag) + "\n").encode()
+        print(f"DIAG-B64-BEGIN lines={len(diag)} md5={hashlib.md5(draw).hexdigest()}\n"
+              + "\n".join(textwrap.wrap(base64.b64encode(gzip.compress(draw, 9)).decode(), 120)) + "\nDIAG-B64-END", flush=True)
+        if len(complete) != len(qs) and not only:
             raise RuntimeError(f"Only {len(complete)}/{len(qs)} public questions finished; rerun the public stage to resume")
 
     def sft_stage(self):
@@ -463,7 +507,7 @@ def main(argv=None):
         atomic_json(config, settings)
     print(f"output: {a.output}; stages: {','.join(a.stages)}; base revision: {flow.manifest['revision']}", flush=True)
     methods = {"setup": flow.setup, "preflight": flow.preflight, "generate": flow.generate,
-               "sft": flow.sft_stage, "notes": flow.notes_stage, "train": flow.train, "public": flow.public}
+               "sft": flow.sft_stage, "notes": flow.notes_stage, "train": flow.train, "holdout": flow.holdout, "public": flow.public}
     for stage in STAGES:
         if stage in a.stages:
             start = time.monotonic()
